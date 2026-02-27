@@ -1,0 +1,44 @@
+{
+  "name": "hnclient",
+  "version": "0.1.0",
+  "description": "Keyboard-first Hacker News terminal client built with OpenTUI",
+  "type": "module",
+  "bin": {
+    "hn": "./bin/hn.cjs"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "tsx src/cli/index.tsx",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src test --ext .ts,.tsx"
+  },
+  "keywords": [
+    "hacker-news",
+    "terminal",
+    "tui",
+    "opentui"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@opentui/core": "^0.1.84",
+    "@opentui/react": "^0.1.84",
+    "html-to-text": "^9.0.5",
+    "react": "^19.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.2",
+    "@types/react": "^19.2.14",
+    "@typescript-eslint/eslint-plugin": "^8.56.1",
+    "@typescript-eslint/parser": "^8.56.1",
+    "eslint": "^10.0.2",
+    "prettier": "^3.8.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}
