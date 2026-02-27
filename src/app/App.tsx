@@ -16,6 +16,12 @@ type SearchMode = "local" | "global";
 interface SearchModalState {
   mode: SearchMode;
   value: string;
+  windowIndex?: number;
+}
+
+interface TimeWindowOption {
+  label: string;
+  seconds: number;
 }
 
 interface AppProps {
@@ -28,6 +34,15 @@ interface AppProps {
 const hn = new FirebaseHNService();
 const search = new AlgoliaSearchService();
 const cache = new FileTtlCache();
+const TIME_WINDOWS: TimeWindowOption[] = [
+  { label: "Last hour", seconds: 60 * 60 },
+  { label: "Last 24 hours", seconds: 24 * 60 * 60 },
+  { label: "Last 3 days", seconds: 3 * 24 * 60 * 60 },
+  { label: "Last 7 days", seconds: 7 * 24 * 60 * 60 },
+  { label: "Last 2 weeks", seconds: 14 * 24 * 60 * 60 },
+  { label: "Last 3 weeks", seconds: 21 * 24 * 60 * 60 },
+  { label: "Last 4 weeks", seconds: 28 * 24 * 60 * 60 }
+];
 
 const domainFromUrl = (url?: string): string => {
   if (!url) return "news.ycombinator.com";
@@ -55,6 +70,9 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
   const [commentCursor, setCommentCursor] = useState(0);
   const [searchQuery, setSearchQuery] = useState(initialSearch ?? "");
   const [searchModal, setSearchModal] = useState<SearchModalState | null>(null);
+  const [timeWindowModal, setTimeWindowModal] = useState(false);
+  const [timeWindowIndex, setTimeWindowIndex] = useState(3);
+  const [globalSearchWindowIndex, setGlobalSearchWindowIndex] = useState(3);
   const [status, setStatus] = useState("Loading Hacker News feed...");
   const [loading, setLoading] = useState(false);
   const [pendingG, setPendingG] = useState(false);
@@ -174,16 +192,21 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
   }, [config.cacheTtlSeconds.item, config.chunkSize, feedIds, getCached, loading, stories.length, toStoryRow]);
 
   const runSearch = useCallback(
-    async (query: string) => {
+    async (query: string, windowSeconds?: number) => {
       const cleaned = query.trim();
       if (!cleaned) {
         setStatus("Search query is empty.");
         return;
       }
+      const effectiveWindow = windowSeconds;
       setLoading(true);
       setStatus(`Searching for \"${cleaned}\"...`);
       try {
-        const page = await getCached(`search:${cleaned}:0`, config.cacheTtlSeconds.search, async () => search.search(cleaned, 0));
+        const page = await getCached(
+          `search:${cleaned}:0:${effectiveWindow ?? "all"}`,
+          config.cacheTtlSeconds.search,
+          async () => search.search(cleaned, 0, effectiveWindow ?? undefined)
+        );
         const rows = page.hits
           .map((hit): StoryRow | null => {
             const id = Number.parseInt(hit.objectID, 10);
@@ -207,9 +230,55 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
         setSearchResults(rows);
         setSearchCursor(0);
         setPane("search");
-        setStatus(`Found ${rows.length} results for \"${cleaned}\".`);
+        const windowLabel = effectiveWindow
+          ? ` in ${TIME_WINDOWS.find((option) => option.seconds === effectiveWindow)?.label ?? "selected range"}`
+          : "";
+        setStatus(`Found ${rows.length} results for \"${cleaned}\"${windowLabel}.`);
       } catch (error) {
         setStatus(`Search failed: ${String(error)}`);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [config.cacheTtlSeconds.search, getCached]
+  );
+
+  const runLatestWindow = useCallback(
+    async (windowSeconds: number) => {
+      const windowLabel = TIME_WINDOWS.find((option) => option.seconds === windowSeconds)?.label ?? "selected window";
+      setLoading(true);
+      setStatus(`Loading latest posts for ${windowLabel}...`);
+      try {
+        const page = await getCached(
+          `latest:0:${windowSeconds}`,
+          config.cacheTtlSeconds.search,
+          async () => search.search("", 0, windowSeconds)
+        );
+        const rows = page.hits
+          .map((hit): StoryRow | null => {
+            const id = Number.parseInt(hit.objectID, 10);
+            if (!Number.isFinite(id)) return null;
+            const row: StoryRow = {
+              id,
+              kind: "story",
+              title: stripHtml(hit.title ?? hit.story_title ?? "(no title)"),
+              by: hit.author ?? "unknown",
+              score: hit.points ?? 0,
+              comments: hit.num_comments ?? 0,
+              time: hit.created_at_i ?? 0
+            };
+            const resolved = hit.url ?? hit.story_url;
+            if (resolved) row.url = resolved;
+            return row;
+          })
+          .filter((row): row is StoryRow => Boolean(row));
+
+        setSearchResults(rows);
+        setSearchCursor(0);
+        setPane("search");
+        setStatus(`Latest posts loaded for ${windowLabel}: ${rows.length} results.`);
+      } catch (error) {
+        setStatus(`Latest load failed: ${String(error)}`);
       } finally {
         setLoading(false);
       }
@@ -344,7 +413,43 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
       return;
     }
 
+    if (timeWindowModal) {
+      if (key.name === "escape") {
+        setTimeWindowModal(false);
+        setStatus("Sort window canceled.");
+        return;
+      }
+      if (key.name === "j" || key.name === "down") {
+        setTimeWindowIndex((prev) => Math.min(prev + 1, TIME_WINDOWS.length - 1));
+        return;
+      }
+      if (key.name === "k" || key.name === "up") {
+        setTimeWindowIndex((prev) => Math.max(prev - 1, 0));
+        return;
+      }
+      if (key.name === "return") {
+        const chosen = TIME_WINDOWS[timeWindowIndex];
+        setTimeWindowModal(false);
+        if (!chosen) return;
+        void runLatestWindow(chosen.seconds);
+      }
+      if (/[1-7]/.test(key.name)) {
+        const idx = Number.parseInt(key.name, 10) - 1;
+        const chosen = TIME_WINDOWS[idx];
+        setTimeWindowModal(false);
+        if (!chosen) return;
+        setTimeWindowIndex(idx);
+        void runLatestWindow(chosen.seconds);
+      }
+      return;
+    }
+
     if (searchModal) {
+      if (key.name === "tab" && searchModal.mode === "global") {
+        const nextIndex = ((searchModal.windowIndex ?? globalSearchWindowIndex) + 1) % TIME_WINDOWS.length;
+        setSearchModal((prev) => (prev ? { ...prev, windowIndex: nextIndex } : prev));
+        return;
+      }
       if (key.name === "escape") {
         setSearchModal(null);
         setStatus("Search canceled.");
@@ -373,7 +478,12 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
     }
 
     if (key.name === "?") {
-      setSearchModal({ mode: "global", value: searchQuery });
+      setSearchModal({ mode: "global", value: searchQuery, windowIndex: globalSearchWindowIndex });
+      return;
+    }
+
+    if (key.name === "l" && key.shift) {
+      setTimeWindowModal(true);
       return;
     }
 
@@ -470,7 +580,7 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
   });
 
   const shortcuts =
-    "j/k move | gg/G top-bottom | Enter open link | Shift+K open HN page | c comments | / local ? global | 1-6 feeds | q quit";
+    "j/k move | gg/G top-bottom | Enter open link | Shift+K open HN page | Shift+L latest by time | c comments | / local ? global | 1-6 feeds | q quit";
 
   return (
     <box flexDirection="column" width="100%" height="100%" backgroundColor="#111111">
@@ -551,6 +661,9 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
           zIndex={30}
         >
           <text fg="#c6c6c6">{searchModal.mode === "local" ? "Local search" : "Global search"}</text>
+          {searchModal.mode === "global" ? (
+            <text fg="#8a8a8a">{`Time window: ${TIME_WINDOWS[searchModal.windowIndex ?? globalSearchWindowIndex]?.label ?? "Last 7 days"} (Tab to change)`}</text>
+          ) : null}
           <input
             focused
             value={searchModal.value}
@@ -560,12 +673,44 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
               if (searchModal.mode === "local") {
                 runLocalSearch(value);
               } else {
-                void runSearch(value);
+                const idx = searchModal.windowIndex ?? globalSearchWindowIndex;
+                const chosen = TIME_WINDOWS[idx];
+                if (chosen) {
+                  setGlobalSearchWindowIndex(idx);
+                  void runSearch(value, chosen.seconds);
+                } else {
+                  void runSearch(value);
+                }
               }
               setSearchModal(null);
             }}
           />
-          <text fg="#8a8a8a">Enter to submit, Esc to cancel</text>
+          <text fg="#8a8a8a">Enter submit, Tab window (global), Esc cancel</text>
+        </box>
+      ) : null}
+
+      {timeWindowModal ? (
+        <box
+          position="absolute"
+          top={Math.max(1, Math.floor(height * 0.3))}
+          left={Math.max(2, Math.floor(width * 0.2))}
+          width={Math.max(32, Math.floor(width * 0.6))}
+          border
+          borderColor="#6b7280"
+          backgroundColor="#1c1c1c"
+          padding={1}
+          zIndex={30}
+        >
+          <text fg="#c6c6c6">Latest Posts Time Window</text>
+          {TIME_WINDOWS.map((option, idx) => {
+            const selected = idx === timeWindowIndex;
+            return (
+              <text key={option.label} fg={selected ? "#f0f0f0" : "#9a9a9a"}>
+                {`${selected ? ">" : " "} ${idx + 1}. ${option.label}`}
+              </text>
+            );
+          })}
+          <text fg="#8a8a8a">j/k or 1-7 to pick, Enter loads latest posts, Esc cancel</text>
         </box>
       ) : null}
     </box>
