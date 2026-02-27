@@ -1,21 +1,31 @@
 # hnclient
 
-Keyboard-first Hacker News terminal client built with OpenTUI and TypeScript.
+A keyboard-first Hacker News terminal client built with TypeScript + OpenTUI.
 
-Runtime requirement: Bun (OpenTUI core depends on Bun runtime APIs).
+## Highlights
 
-## Features
+- Fully keyboard-driven workflow (no mouse required)
+- Vim-style movement (`j/k`, `gg`, `G`)
+- Breathable card-style story layout with color accents
+- Read-state dimming (opened stories become gray)
+- Centered Hacker News header + footer shortcut bar
+- Modal search input boxes using OpenTUI input component
+  - `/` local search in current feed
+  - `?` global Algolia search
+- `Enter` opens selected story directly in your system browser
+- `Shift+K` opens selected story on `news.ycombinator.com/item?id=...`
+- `c` opens threaded comments in terminal
+- Terminal is cleared on exit (`q`/`Ctrl+C`)
 
-- Full keyboard navigation (no mouse required)
-- Vim-like motions: `j/k`, `gg`, `G`, `q`
-- Feed parity via official Firebase feeds: `top`, `new`, `best`, `ask`, `show`, `job`
-- Global search via Algolia HN API (`?`)
-- Local search inside loaded feed (`/`)
-- Threaded comments with collapse/expand (`h`/`l`)
-- In-terminal article rendering (`o`)
-- XDG config/cache persistence
+## Runtime Requirement
 
-## Install
+OpenTUI depends on Bun runtime APIs, so you need Bun installed:
+
+- Install: https://bun.sh
+
+The global `hn` command is a launcher script that runs the compiled app with Bun.
+
+## Install (Local)
 
 ```bash
 npm install
@@ -23,40 +33,78 @@ npm run build
 npm link
 ```
 
-Then run:
+Run:
 
 ```bash
-hn
+hn --feed top
 ```
 
 ## Usage
 
 ```bash
-hn --feed top
+hn --feed new
 hn --search "postgres"
 hn --no-cache
 ```
 
 ## Keybindings
 
-- `j/k` or `up/down`: move
-- `gg` / `G`: top / bottom
-- `/`: local search in current feed
-- `?`: global search (Algolia)
-- `n` / `N`: next/previous local match
-- `Enter`: open comments
-- `o`: open article in terminal
-- `h` / `l`: collapse/expand comment thread
-- `1..6`: switch feeds (`top/new/best/ask/show/job`)
-- `r`: refresh current feed
-- `q` or `Esc`: back or quit
+- `j/k` or arrows: move selection
+- `gg` / `G`: jump to top / bottom
+- `Enter`: open selected story in browser
+- `Shift+K`: open selected story on HN item page
+- `c`: open comments view
+- `h/l`: collapse or expand comment node
+- `/`: local search modal (current feed)
+- `?`: global search modal (Algolia)
+- `n` / `N`: next / previous local match
+- `1..6`: switch feeds (`top`, `new`, `best`, `ask`, `show`, `job`)
+- `r`: refresh feed
+- `q` or `Esc`: back/quit
+- `Ctrl+C`: quit and clear terminal
 
-## Storage
+## Config and Cache
 
 - Config: `~/.config/hnclient/config.json`
 - Cache: `~/.cache/hnclient/cache.json`
 
-## Notes
+## Build and Test
 
-- Authenticated write actions (login/vote/comment/post) are intentionally not implemented in v1.
-- v1 is read-only and uses official feed APIs plus Algolia search.
+```bash
+npm run typecheck
+npm run lint
+npm test
+npm run build
+```
+
+## Publish to npm
+
+1. Ensure you are logged in:
+```bash
+npm login
+```
+
+2. Pick a unique package name in `package.json` (current `hnclient` may already be taken).
+
+3. Bump version:
+```bash
+npm version patch
+```
+
+4. Build and verify:
+```bash
+npm run typecheck
+npm run test
+npm run build
+```
+
+5. Publish:
+```bash
+npm publish --access public
+```
+
+If you publish under an npm scope (for example `@yourname/hnclient`), update `name` in `package.json` and publish with:
+
+```bash
+npm publish --access public
+```

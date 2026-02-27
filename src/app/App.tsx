@@ -1,16 +1,22 @@
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { openExternal } from "../core/browser.js";
 import { buildCommentTree, flattenCommentTree } from "../core/comments.js";
 import { FEEDS } from "../core/constants.js";
+import { clearTerminal } from "../core/terminal.js";
 import type { AppConfig, CommentNode, FeedType, HNItem, StoryRow } from "../core/types.js";
 import { stripHtml, trimLine, unixToRelative } from "../core/utils.js";
 import { AlgoliaSearchService } from "../data/algolia.js";
 import { FirebaseHNService } from "../data/firebase.js";
-import { ArticleService } from "../render/article.js";
 import { FileTtlCache } from "../store/ttl-cache.js";
 
-type Pane = "feed" | "comments" | "search" | "article";
-type InputMode = "local" | "global";
+type Pane = "feed" | "search" | "comments";
+type SearchMode = "local" | "global";
+
+interface SearchModalState {
+  mode: SearchMode;
+  value: string;
+}
 
 interface AppProps {
   config: AppConfig;
@@ -21,78 +27,53 @@ interface AppProps {
 
 const hn = new FirebaseHNService();
 const search = new AlgoliaSearchService();
-const article = new ArticleService();
 const cache = new FileTtlCache();
 
-export function App({ config, initialFeed, initialSearch, noCache = false }: AppProps) {
-  const { height } = useTerminalDimensions();
+const domainFromUrl = (url?: string): string => {
+  if (!url) return "news.ycombinator.com";
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+};
+
+export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
+  const { width, height } = useTerminalDimensions();
+
   const [pane, setPane] = useState<Pane>("feed");
-  const [paneStack, setPaneStack] = useState<Pane[]>([]);
-  const [sourcePane, setSourcePane] = useState<Pane>("feed");
   const [feed, setFeed] = useState<FeedType>(initialFeed);
   const [feedIds, setFeedIds] = useState<number[]>([]);
   const [stories, setStories] = useState<StoryRow[]>([]);
   const [cursor, setCursor] = useState(0);
-  const [status, setStatus] = useState("Loading feed...");
-  const [loading, setLoading] = useState(false);
-  const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
-  const [commentTree, setCommentTree] = useState<CommentNode[]>([]);
-  const [flatComments, setFlatComments] = useState<CommentNode[]>([]);
-  const [commentCursor, setCommentCursor] = useState(0);
-  const [articleBodyLines, setArticleBodyLines] = useState<string[]>([]);
-  const [articleTitle, setArticleTitle] = useState<string>("");
-  const [articleUrl, setArticleUrl] = useState<string>("");
-  const [articleOffset, setArticleOffset] = useState(0);
-  const [activeStory, setActiveStory] = useState<StoryRow | null>(null);
-  const [searchQuery, setSearchQuery] = useState(initialSearch ?? "");
   const [searchResults, setSearchResults] = useState<StoryRow[]>([]);
   const [searchCursor, setSearchCursor] = useState(0);
-  const [inputMode, setInputMode] = useState<InputMode | null>(initialSearch ? null : null);
-  const [inputValue, setInputValue] = useState("");
-  const [localMatches, setLocalMatches] = useState<number[]>([]);
-  const [localMatchIdx, setLocalMatchIdx] = useState(0);
+  const [activeStory, setActiveStory] = useState<StoryRow | null>(null);
+  const [commentTree, setCommentTree] = useState<CommentNode[]>([]);
+  const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
+  const [flatComments, setFlatComments] = useState<CommentNode[]>([]);
+  const [commentCursor, setCommentCursor] = useState(0);
+  const [searchQuery, setSearchQuery] = useState(initialSearch ?? "");
+  const [searchModal, setSearchModal] = useState<SearchModalState | null>(null);
+  const [status, setStatus] = useState("Loading Hacker News feed...");
+  const [loading, setLoading] = useState(false);
   const [pendingG, setPendingG] = useState(false);
+  const [readIds, setReadIds] = useState<Set<number>>(new Set());
+  const [localMatches, setLocalMatches] = useState<number[]>([]);
+  const [localMatchIndex, setLocalMatchIndex] = useState(0);
 
-  const pageSize = Math.max(8, height - 7);
+  const headerHeight = Math.max(1, Math.floor(height * 0.05));
+  const footerHeight = Math.max(1, Math.floor(height * 0.05));
+  const contentHeight = Math.max(1, height - headerHeight - footerHeight);
 
-  const visibleStories = useMemo(() => {
-    const start = Math.max(0, cursor - Math.floor(pageSize / 2));
-    const end = Math.min(stories.length, start + pageSize);
-    return {
-      start,
-      rows: stories.slice(start, end)
-    };
-  }, [cursor, pageSize, stories]);
-
-  const visibleComments = useMemo(() => {
-    const start = Math.max(0, commentCursor - Math.floor(pageSize / 2));
-    const end = Math.min(flatComments.length, start + pageSize);
-    return {
-      start,
-      rows: flatComments.slice(start, end)
-    };
-  }, [commentCursor, flatComments, pageSize]);
-
-  const visibleSearch = useMemo(() => {
-    const start = Math.max(0, searchCursor - Math.floor(pageSize / 2));
-    const end = Math.min(searchResults.length, start + pageSize);
-    return {
-      start,
-      rows: searchResults.slice(start, end)
-    };
-  }, [searchCursor, searchResults, pageSize]);
-
-  const activeStoryList = pane === "search" ? searchResults : stories;
+  const currentList = pane === "search" ? searchResults : stories;
+  const currentCursor = pane === "search" ? searchCursor : cursor;
 
   const getCached = useCallback(
     async <T,>(key: string, ttl: number, loader: () => Promise<T>): Promise<T> => {
-      if (noCache) {
-        return loader();
-      }
+      if (noCache) return loader();
       const hit = await cache.get<T>(key);
-      if (hit) {
-        return hit;
-      }
+      if (hit) return hit;
       const loaded = await loader();
       await cache.set(key, loaded, ttl);
       return loaded;
@@ -103,6 +84,7 @@ export function App({ config, initialFeed, initialSearch, noCache = false }: App
   const toStoryRow = useCallback((item: HNItem): StoryRow | null => {
     if (!item || !item.id) return null;
     if (!["story", "job", "poll"].includes(item.type)) return null;
+
     const row: StoryRow = {
       id: item.id,
       kind: item.type,
@@ -112,64 +94,60 @@ export function App({ config, initialFeed, initialSearch, noCache = false }: App
       comments: item.descendants ?? 0,
       time: item.time ?? 0
     };
-    if (item.url) {
-      row.url = item.url;
-    }
+    if (item.url) row.url = item.url;
     return row;
   }, []);
 
-  const loadMoreStories = useCallback(async () => {
-    if (loading || stories.length >= feedIds.length) {
-      return;
-    }
+  const markRead = useCallback((storyId: number) => {
+    setReadIds((prev) => {
+      const next = new Set(prev);
+      next.add(storyId);
+      return next;
+    });
+  }, []);
 
-    setLoading(true);
-    try {
-      const nextIds = feedIds.slice(stories.length, stories.length + config.chunkSize);
-      const items = await Promise.all(
-        nextIds.map((id) =>
-          getCached(`item:${id}`, config.cacheTtlSeconds.item, async () => {
-            const item = await hn.getItem(id);
-            return item;
-          })
-        )
-      );
+  const selectedStory = useMemo(() => {
+    if (pane === "feed") return stories[cursor] ?? null;
+    if (pane === "search") return searchResults[searchCursor] ?? null;
+    return activeStory;
+  }, [activeStory, cursor, pane, searchCursor, searchResults, stories]);
 
-      const nextRows = items.map((item) => (item ? toStoryRow(item) : null)).filter((row): row is StoryRow => Boolean(row));
-      setStories((prev) => [...prev, ...nextRows]);
-      setStatus(`${feed.toUpperCase()} ${Math.min(stories.length + nextRows.length, feedIds.length)}/${feedIds.length}`);
-    } catch (error) {
-      setStatus(`Failed loading feed chunk: ${String(error)}`);
-    } finally {
-      setLoading(false);
-    }
-  }, [config.cacheTtlSeconds.item, config.chunkSize, feed, feedIds, getCached, loading, stories.length, toStoryRow]);
+  const itemBlockHeight = pane === "comments" ? 1 : 3;
+  const visibleItems = Math.max(1, Math.floor((contentHeight - 4) / itemBlockHeight));
+
+  const feedWindow = useMemo(() => {
+    const start = Math.max(0, currentCursor - Math.floor(visibleItems / 2));
+    const end = Math.min(currentList.length, start + visibleItems);
+    return { start, rows: currentList.slice(start, end) };
+  }, [currentCursor, currentList, visibleItems]);
+
+  const commentsWindow = useMemo(() => {
+    const start = Math.max(0, commentCursor - Math.floor(visibleItems / 2));
+    const end = Math.min(flatComments.length, start + visibleItems);
+    return { start, rows: flatComments.slice(start, end) };
+  }, [commentCursor, flatComments, visibleItems]);
 
   const refreshFeed = useCallback(
-    async (targetFeed: FeedType, shouldResetCursor = true) => {
+    async (targetFeed: FeedType, resetCursor = true) => {
       setLoading(true);
       setStatus(`Loading ${targetFeed}...`);
       try {
         const ids = await getCached(`feed:${targetFeed}`, config.cacheTtlSeconds.feed, async () => hn.getFeedIds(targetFeed));
         setFeedIds(ids);
-        setStories([]);
         setFeed(targetFeed);
-        if (shouldResetCursor) setCursor(0);
+        setPane("feed");
+        if (resetCursor) setCursor(0);
 
         const firstIds = ids.slice(0, config.chunkSize);
         const items = await Promise.all(
-          firstIds.map((id) =>
-            getCached(`item:${id}`, config.cacheTtlSeconds.item, async () => {
-              const item = await hn.getItem(id);
-              return item;
-            })
-          )
+          firstIds.map((id) => getCached(`item:${id}`, config.cacheTtlSeconds.item, async () => hn.getItem(id)))
         );
+
         const rows = items.map((item) => (item ? toStoryRow(item) : null)).filter((row): row is StoryRow => Boolean(row));
         setStories(rows);
         setStatus(`${targetFeed.toUpperCase()} ${rows.length}/${ids.length}`);
       } catch (error) {
-        setStatus(`Feed error: ${String(error)}`);
+        setStatus(`Feed load failed: ${String(error)}`);
       } finally {
         setLoading(false);
       }
@@ -177,87 +155,35 @@ export function App({ config, initialFeed, initialSearch, noCache = false }: App
     [config.cacheTtlSeconds.feed, config.cacheTtlSeconds.item, config.chunkSize, getCached, toStoryRow]
   );
 
-  const loadComments = useCallback(
-    async (story: StoryRow, fromPane: Pane) => {
-      setLoading(true);
-      setStatus(`Loading comments for ${story.id}...`);
-      try {
-        const root = await getCached(`item:${story.id}`, config.cacheTtlSeconds.item, async () => hn.getItem(story.id));
-        const kids = root?.kids ?? [];
-        const queue = [...kids];
-        const map: Record<number, HNItem> = {};
-        const visited = new Set<number>();
+  const loadMore = useCallback(async () => {
+    if (loading || stories.length >= feedIds.length) return;
+    setLoading(true);
+    try {
+      const ids = feedIds.slice(stories.length, stories.length + config.chunkSize);
+      const items = await Promise.all(
+        ids.map((id) => getCached(`item:${id}`, config.cacheTtlSeconds.item, async () => hn.getItem(id)))
+      );
+      const rows = items.map((item) => (item ? toStoryRow(item) : null)).filter((row): row is StoryRow => Boolean(row));
+      setStories((prev) => [...prev, ...rows]);
+      setStatus(`Loaded ${Math.min(stories.length + rows.length, feedIds.length)} of ${feedIds.length}`);
+    } catch (error) {
+      setStatus(`Could not load more stories: ${String(error)}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [config.cacheTtlSeconds.item, config.chunkSize, feedIds, getCached, loading, stories.length, toStoryRow]);
 
-        while (queue.length > 0) {
-          const id = queue.shift();
-          if (!id || visited.has(id)) continue;
-          visited.add(id);
-
-          const item = await getCached(`item:${id}`, config.cacheTtlSeconds.item, async () => hn.getItem(id));
-          if (!item) continue;
-          map[item.id] = item;
-          for (const childId of item.kids ?? []) {
-            if (!visited.has(childId)) queue.push(childId);
-          }
-        }
-
-        const tree = buildCommentTree(kids, map);
-        const flat = flattenCommentTree(tree, new Set());
-        setCommentTree(tree);
-        setFlatComments(flat);
-        setCollapsed(new Set());
-        setCommentCursor(0);
-        setActiveStory(story);
-        setSourcePane(fromPane);
-        setPaneStack((prev) => [...prev, pane]);
-        setPane("comments");
-        setStatus(`Comments: ${flat.length} visible`);
-      } catch (error) {
-        setStatus(`Comment load error: ${String(error)}`);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [config.cacheTtlSeconds.item, getCached, pane]
-  );
-
-  const openArticle = useCallback(
-    async (story: StoryRow) => {
-      if (!story.url) {
-        setStatus("No URL for this item.");
-        return;
-      }
-
-      setLoading(true);
-      setStatus(`Loading article ${story.url}...`);
-      try {
-        const doc = await getCached(`article:${story.url}`, config.cacheTtlSeconds.article, async () => article.render(story.url!));
-        setArticleTitle(doc.title || story.title);
-        setArticleUrl(doc.url);
-        setArticleBodyLines(doc.body.split("\n"));
-        setArticleOffset(0);
-        setPaneStack((prev) => [...prev, pane]);
-        setPane("article");
-        setStatus(`Article loaded (${doc.status}).`);
-      } catch (error) {
-        setStatus(`Article load error: ${String(error)}`);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [config.cacheTtlSeconds.article, getCached, pane]
-  );
-
-  const runGlobalSearch = useCallback(
+  const runSearch = useCallback(
     async (query: string) => {
-      if (!query.trim()) {
+      const cleaned = query.trim();
+      if (!cleaned) {
         setStatus("Search query is empty.");
         return;
       }
       setLoading(true);
-      setStatus(`Searching for \"${query}\"...`);
+      setStatus(`Searching for \"${cleaned}\"...`);
       try {
-        const page = await getCached(`search:${query}:0`, config.cacheTtlSeconds.search, async () => search.search(query, 0));
+        const page = await getCached(`search:${cleaned}:0`, config.cacheTtlSeconds.search, async () => search.search(cleaned, 0));
         const rows = page.hits
           .map((hit): StoryRow | null => {
             const id = Number.parseInt(hit.objectID, 10);
@@ -271,20 +197,19 @@ export function App({ config, initialFeed, initialSearch, noCache = false }: App
               comments: hit.num_comments ?? 0,
               time: hit.created_at_i ?? 0
             };
-            const resolvedUrl = hit.url ?? hit.story_url;
-            if (resolvedUrl) {
-              row.url = resolvedUrl;
-            }
+            const resolved = hit.url ?? hit.story_url;
+            if (resolved) row.url = resolved;
             return row;
           })
           .filter((row): row is StoryRow => Boolean(row));
-        setSearchQuery(query);
+
+        setSearchQuery(cleaned);
         setSearchResults(rows);
         setSearchCursor(0);
         setPane("search");
-        setStatus(`Search found ${rows.length} results.`);
+        setStatus(`Found ${rows.length} results for \"${cleaned}\".`);
       } catch (error) {
-        setStatus(`Search error: ${String(error)}`);
+        setStatus(`Search failed: ${String(error)}`);
       } finally {
         setLoading(false);
       }
@@ -292,23 +217,76 @@ export function App({ config, initialFeed, initialSearch, noCache = false }: App
     [config.cacheTtlSeconds.search, getCached]
   );
 
-  useEffect(() => {
-    void refreshFeed(initialFeed, true);
-  }, [initialFeed, refreshFeed]);
+  const runLocalSearch = useCallback(
+    (query: string) => {
+      const cleaned = query.trim().toLowerCase();
+      if (!cleaned) {
+        setLocalMatches([]);
+        setStatus("Local search cleared.");
+        return;
+      }
 
-  useEffect(() => {
-    if (initialSearch) {
-      void runGlobalSearch(initialSearch);
-    }
-  }, [initialSearch, runGlobalSearch]);
+      const matches = stories
+        .map((story, idx) => ({ idx, hit: story.title.toLowerCase().includes(cleaned) }))
+        .filter((row) => row.hit)
+        .map((row) => row.idx);
 
-  useEffect(() => {
-    if (pane === "feed" && cursor >= stories.length - 3 && stories.length < feedIds.length) {
-      void loadMoreStories();
-    }
-  }, [cursor, feedIds.length, loadMoreStories, pane, stories.length]);
+      setLocalMatches(matches);
+      setLocalMatchIndex(0);
+      if (matches.length > 0) {
+        setCursor(matches[0]!);
+        setPane("feed");
+        setStatus(`Local matches: ${matches.length}`);
+      } else {
+        setStatus("No local matches.");
+      }
+    },
+    [stories]
+  );
 
-  const setCommentCollapse = useCallback(
+  const loadComments = useCallback(
+    async (story: StoryRow) => {
+      setLoading(true);
+      setStatus(`Loading comments for ${story.id}...`);
+      try {
+        const root = await getCached(`item:${story.id}`, config.cacheTtlSeconds.item, async () => hn.getItem(story.id));
+        const queue = [...(root?.kids ?? [])];
+        const visited = new Set<number>();
+        const map: Record<number, HNItem> = {};
+
+        while (queue.length > 0) {
+          const id = queue.shift();
+          if (!id || visited.has(id)) continue;
+          visited.add(id);
+
+          const item = await getCached(`item:${id}`, config.cacheTtlSeconds.item, async () => hn.getItem(id));
+          if (!item) continue;
+          map[item.id] = item;
+          for (const kid of item.kids ?? []) {
+            if (!visited.has(kid)) queue.push(kid);
+          }
+        }
+
+        const tree = buildCommentTree(root?.kids ?? [], map);
+        const flat = flattenCommentTree(tree, new Set());
+
+        setActiveStory(story);
+        setCommentTree(tree);
+        setCollapsed(new Set());
+        setFlatComments(flat);
+        setCommentCursor(0);
+        setPane("comments");
+        setStatus(`Comments loaded: ${flat.length}`);
+      } catch (error) {
+        setStatus(`Comment load failed: ${String(error)}`);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [config.cacheTtlSeconds.item, getCached]
+  );
+
+  const setCollapse = useCallback(
     (commentId: number, collapse: boolean) => {
       setCollapsed((prev) => {
         const next = new Set(prev);
@@ -321,88 +299,66 @@ export function App({ config, initialFeed, initialSearch, noCache = false }: App
     [commentTree]
   );
 
-  const back = useCallback(() => {
-    if (inputMode) {
-      setInputMode(null);
-      setInputValue("");
-      return;
-    }
+  const openSelected = useCallback(
+    (onHn: boolean) => {
+      if (!selectedStory) return;
+      const target = onHn
+        ? `https://news.ycombinator.com/item?id=${selectedStory.id}`
+        : (selectedStory.url ?? `https://news.ycombinator.com/item?id=${selectedStory.id}`);
 
-    const prev = paneStack[paneStack.length - 1];
-    if (prev) {
-      setPaneStack((stack) => stack.slice(0, -1));
-      setPane(prev);
-      setStatus(`Back to ${prev}.`);
-      return;
-    }
+      const ok = openExternal(target);
+      if (ok) {
+        markRead(selectedStory.id);
+        setStatus(`Opened: ${target}`);
+      } else {
+        setStatus("Could not launch browser.");
+      }
+    },
+    [markRead, selectedStory]
+  );
 
-    if (pane === "search" && sourcePane === "feed") {
-      setPane("feed");
-      setStatus("Back to feed.");
-      return;
-    }
+  const exitApp = useCallback(() => {
+    clearTerminal();
+    process.exit(0);
+  }, []);
 
-    if (pane === "feed") {
-      process.exit(0);
-    }
-  }, [inputMode, pane, paneStack, sourcePane]);
+  useEffect(() => {
+    void refreshFeed(initialFeed, true);
+  }, [initialFeed, refreshFeed]);
 
-  const charFromKey = (name: string, shift: boolean): string | null => {
-    if (name === "space") return " ";
-    if (name.length === 1) {
-      return shift ? name.toUpperCase() : name;
+  useEffect(() => {
+    if (initialSearch) {
+      void runSearch(initialSearch);
     }
-    return null;
-  };
+  }, [initialSearch, runSearch]);
+
+  useEffect(() => {
+    if (pane === "feed" && cursor >= stories.length - 2 && stories.length < feedIds.length) {
+      void loadMore();
+    }
+  }, [cursor, feedIds.length, loadMore, pane, stories.length]);
 
   useKeyboard((key) => {
     if (key.ctrl && key.name === "c") {
-      process.exit(0);
+      exitApp();
+      return;
     }
 
-    if (inputMode) {
+    if (searchModal) {
       if (key.name === "escape") {
-        setInputMode(null);
-        setInputValue("");
-        setStatus("Canceled input.");
-        return;
-      }
-      if (key.name === "return") {
-        const value = inputValue.trim();
-        if (inputMode === "local") {
-          const q = value.toLowerCase();
-          const matches = stories
-            .map((row, idx) => ({ idx, hit: row.title.toLowerCase().includes(q) }))
-            .filter((item) => item.hit)
-            .map((item) => item.idx);
-          setLocalMatches(matches);
-          setLocalMatchIdx(0);
-          if (matches.length > 0) {
-            setCursor(matches[0]!);
-            setStatus(`Local matches: ${matches.length}.`);
-          } else {
-            setStatus("No local matches.");
-          }
-        } else {
-          void runGlobalSearch(value);
-        }
-        setInputMode(null);
-        setInputValue("");
-        return;
-      }
-      if (key.name === "backspace") {
-        setInputValue((prev) => prev.slice(0, -1));
-        return;
-      }
-      const char = charFromKey(key.name, key.shift);
-      if (char) {
-        setInputValue((prev) => `${prev}${char}`);
+        setSearchModal(null);
+        setStatus("Search canceled.");
       }
       return;
     }
 
     if (key.name === "q" || key.name === "escape") {
-      back();
+      if (pane === "comments" || pane === "search") {
+        setPane("feed");
+        setStatus("Back to feed.");
+      } else {
+        exitApp();
+      }
       return;
     }
 
@@ -412,101 +368,85 @@ export function App({ config, initialFeed, initialSearch, noCache = false }: App
     }
 
     if (key.name === "/") {
-      setInputMode("local");
-      setInputValue("");
-      setStatus("Local search (current feed): type and Enter.");
+      setSearchModal({ mode: "local", value: "" });
       return;
     }
 
     if (key.name === "?") {
-      setInputMode("global");
-      setInputValue(searchQuery);
-      setStatus("Global search (Algolia): type and Enter.");
+      setSearchModal({ mode: "global", value: searchQuery });
       return;
     }
 
     if (key.name === "n" && localMatches.length > 0) {
-      const next = (localMatchIdx + 1) % localMatches.length;
-      setLocalMatchIdx(next);
+      const next = (localMatchIndex + 1) % localMatches.length;
+      setLocalMatchIndex(next);
       setCursor(localMatches[next]!);
+      setPane("feed");
       return;
     }
 
     if (key.name === "n" && key.shift && localMatches.length > 0) {
-      const next = (localMatchIdx - 1 + localMatches.length) % localMatches.length;
-      setLocalMatchIdx(next);
+      const next = (localMatchIndex - 1 + localMatches.length) % localMatches.length;
+      setLocalMatchIndex(next);
       setCursor(localMatches[next]!);
+      setPane("feed");
+      return;
+    }
+
+    if (key.name === "g" && key.shift) {
+      if (pane === "feed") setCursor(Math.max(0, stories.length - 1));
+      if (pane === "search") setSearchCursor(Math.max(0, searchResults.length - 1));
+      if (pane === "comments") setCommentCursor(Math.max(0, flatComments.length - 1));
       return;
     }
 
     if (key.name === "g") {
       if (pendingG) {
         if (pane === "feed") setCursor(0);
-        if (pane === "comments") setCommentCursor(0);
         if (pane === "search") setSearchCursor(0);
-        if (pane === "article") setArticleOffset(0);
+        if (pane === "comments") setCommentCursor(0);
         setPendingG(false);
       } else {
         setPendingG(true);
-        setTimeout(() => setPendingG(false), 400);
+        setTimeout(() => setPendingG(false), 350);
       }
-      return;
-    }
-
-    if (key.name === "G") {
-      if (pane === "feed") setCursor(Math.max(0, stories.length - 1));
-      if (pane === "comments") setCommentCursor(Math.max(0, flatComments.length - 1));
-      if (pane === "search") setSearchCursor(Math.max(0, searchResults.length - 1));
-      if (pane === "article") setArticleOffset(Math.max(0, articleBodyLines.length - pageSize));
       return;
     }
 
     if (key.name.length === 1 && /[1-6]/.test(key.name)) {
       const idx = Number.parseInt(key.name, 10) - 1;
       const selectedFeed = FEEDS[idx];
-      if (selectedFeed) {
-        setPane("feed");
-        setPaneStack([]);
-        void refreshFeed(selectedFeed, true);
-      }
+      if (selectedFeed) void refreshFeed(selectedFeed, true);
       return;
     }
 
-    if (pane === "feed") {
-      if (key.name === "j" || key.name === "down") {
-        setCursor((prev) => Math.min(prev + 1, Math.max(0, stories.length - 1)));
-      }
-      if (key.name === "k" || key.name === "up") {
-        setCursor((prev) => Math.max(prev - 1, 0));
-      }
-      if (key.name === "return") {
-        const story = stories[cursor];
-        if (story) void loadComments(story, "feed");
-      }
-      if (key.name === "o") {
-        const story = stories[cursor];
-        if (story) void openArticle(story);
-      }
-      if (key.name === "space") {
-        void loadMoreStories();
-      }
+    if (key.name === "return") {
+      openSelected(false);
       return;
     }
 
-    if (pane === "search") {
+    if (key.name === "k" && key.shift) {
+      openSelected(true);
+      return;
+    }
+
+    if (pane === "feed" || pane === "search") {
       if (key.name === "j" || key.name === "down") {
-        setSearchCursor((prev) => Math.min(prev + 1, Math.max(0, searchResults.length - 1)));
+        if (pane === "feed") setCursor((prev) => Math.min(prev + 1, Math.max(0, stories.length - 1)));
+        if (pane === "search") setSearchCursor((prev) => Math.min(prev + 1, Math.max(0, searchResults.length - 1)));
       }
+
       if (key.name === "k" || key.name === "up") {
-        setSearchCursor((prev) => Math.max(prev - 1, 0));
+        if (pane === "feed") setCursor((prev) => Math.max(prev - 1, 0));
+        if (pane === "search") setSearchCursor((prev) => Math.max(prev - 1, 0));
       }
-      if (key.name === "return") {
-        const story = searchResults[searchCursor];
-        if (story) void loadComments(story, "search");
+
+      if (key.name === "c" && selectedStory) {
+        void loadComments(selectedStory);
       }
-      if (key.name === "o") {
-        const story = searchResults[searchCursor];
-        if (story) void openArticle(story);
+
+      if (key.name === "space" && pane === "feed") {
+        void loadMore();
       }
       return;
     }
@@ -520,90 +460,114 @@ export function App({ config, initialFeed, initialSearch, noCache = false }: App
       }
       if (key.name === "h") {
         const current = flatComments[commentCursor];
-        if (current && current.children.length > 0) {
-          setCommentCollapse(current.id, true);
-        }
+        if (current && current.children.length > 0) setCollapse(current.id, true);
       }
       if (key.name === "l") {
         const current = flatComments[commentCursor];
-        if (current) {
-          setCommentCollapse(current.id, false);
-        }
-      }
-      if (key.name === "o" && activeStory) {
-        void openArticle(activeStory);
-      }
-      return;
-    }
-
-    if (pane === "article") {
-      if (key.name === "j" || key.name === "down") {
-        setArticleOffset((prev) => Math.min(prev + 1, Math.max(0, articleBodyLines.length - pageSize)));
-      }
-      if (key.name === "k" || key.name === "up") {
-        setArticleOffset((prev) => Math.max(prev - 1, 0));
+        if (current) setCollapse(current.id, false);
       }
     }
   });
 
-  const helpLine =
-    "j/k move  gg/G top/bottom  / local  ? global  n/N next/prev  Enter comments  o article  1..6 feeds  q back/quit";
-
-  const header = `HN ${feed.toUpperCase()} | pane:${pane} | loaded:${stories.length}/${feedIds.length}`;
-
-  const renderFeedLines = () => {
-    if (stories.length === 0) return ["No stories loaded."];
-    return visibleStories.rows.map((story, idx) => {
-      const absolute = visibleStories.start + idx;
-      const marker = absolute === cursor ? ">" : " ";
-      return `${marker} ${String(absolute + 1).padStart(3, "0")} ${trimLine(story.title, 90)}  (${story.score} pts, ${story.comments} comments, ${unixToRelative(story.time)})`;
-    });
-  };
-
-  const renderCommentLines = () => {
-    if (flatComments.length === 0) return ["No comments."];
-    return visibleComments.rows.map((comment, idx) => {
-      const absolute = visibleComments.start + idx;
-      const marker = absolute === commentCursor ? ">" : " ";
-      const collapsedMark = comment.children.length > 0 ? (collapsed.has(comment.id) ? "[+]" : "[-]") : "   ";
-      const indent = "  ".repeat(comment.depth);
-      const text = trimLine(stripHtml(comment.text), 80);
-      return `${marker} ${collapsedMark} ${indent}${comment.by}: ${text}`;
-    });
-  };
-
-  const renderSearchLines = () => {
-    if (searchResults.length === 0) return ["No search results."];
-    return visibleSearch.rows.map((story, idx) => {
-      const absolute = visibleSearch.start + idx;
-      const marker = absolute === searchCursor ? ">" : " ";
-      return `${marker} ${String(absolute + 1).padStart(3, "0")} ${trimLine(story.title, 90)} (${story.comments} comments)`;
-    });
-  };
-
-  const renderArticleLines = () => {
-    const viewport = articleBodyLines.slice(articleOffset, articleOffset + pageSize);
-    const top = `${articleTitle}\n${articleUrl}\n${"-".repeat(40)}`;
-    return [top, ...viewport.map((line) => trimLine(line, 100))];
-  };
-
-  const bodyLines =
-    pane === "feed"
-      ? renderFeedLines()
-      : pane === "comments"
-        ? renderCommentLines()
-        : pane === "search"
-          ? renderSearchLines()
-          : renderArticleLines();
+  const shortcuts =
+    "j/k move | gg/G top-bottom | Enter open link | Shift+K open HN page | c comments | / local ? global | 1-6 feeds | q quit";
 
   return (
-    <box flexDirection="column" width="100%" height="100%" padding={1}>
-      <text>{header}</text>
-      <text>{loading ? "Loading..." : status}</text>
-      <text>{helpLine}</text>
-      <text>{""}</text>
-      <text>{bodyLines.join("\n")}</text>
-      {inputMode ? <text>{`${inputMode === "local" ? "/" : "?"}${inputValue}`}</text> : null}
+    <box flexDirection="column" width="100%" height="100%" backgroundColor="#111111">
+      <box height={headerHeight} justifyContent="center" alignItems="center" paddingX={1}>
+        <text fg="#f6a423">Hacker News</text>
+      </box>
+
+      <box height={contentHeight} paddingX={2} paddingY={1} flexDirection="column" overflow="hidden">
+        <text fg="#888888">{`${feed.toUpperCase()} | pane:${pane} | loaded ${stories.length}/${feedIds.length}`}</text>
+        <text fg={loading ? "#d1ad5f" : "#7fa9d8"}>{loading ? "Loading..." : status}</text>
+        <text>{""}</text>
+
+        {pane === "comments" ? (
+          <box flexDirection="column">
+            {activeStory ? <text fg="#dfdfdf">{trimLine(activeStory.title, Math.max(20, width - 8))}</text> : null}
+            <text fg="#8a8a8a">h/l collapse-expand</text>
+            <text>{""}</text>
+            {commentsWindow.rows.length === 0 ? (
+              <text fg="#888888">No comments available.</text>
+            ) : (
+              commentsWindow.rows.map((comment, idx) => {
+                const absolute = commentsWindow.start + idx;
+                const selected = absolute === commentCursor;
+                const marker = selected ? ">" : " ";
+                const fold = comment.children.length > 0 ? (collapsed.has(comment.id) ? "[+]" : "[-]") : "[ ]";
+                const indent = "  ".repeat(comment.depth);
+                const row = `${marker} ${fold} ${indent}${comment.by}: ${trimLine(stripHtml(comment.text), Math.max(20, width - 14))}`;
+                return (
+                  <text key={`${comment.id}-${absolute}`} fg={selected ? "#e8e8e8" : "#a0a0a0"}>
+                    {row}
+                  </text>
+                );
+              })
+            )}
+          </box>
+        ) : (
+          <box flexDirection="column">
+            {feedWindow.rows.length === 0 ? (
+              <text fg="#888888">No stories loaded.</text>
+            ) : (
+              feedWindow.rows.map((story, idx) => {
+                const absolute = feedWindow.start + idx;
+                const selected = absolute === currentCursor;
+                const read = readIds.has(story.id);
+                const titleColor = read ? "#777777" : selected ? "#f2f2f2" : "#d7d7d7";
+                const metaColor = read ? "#666666" : "#8f8f8f";
+                const domainSuffix = story.url ? ` (${domainFromUrl(story.url)})` : "";
+                const titleRoom = Math.max(20, width - 12 - domainSuffix.length);
+                const title = `${selected ? ">" : " "} ${absolute + 1}. ${trimLine(story.title, titleRoom)}${domainSuffix}`;
+                const meta = `   ${story.score} points by ${story.by} | ${story.comments} comments | ${unixToRelative(story.time)}`;
+                return (
+                  <box key={`${story.id}-${absolute}`} flexDirection="column">
+                    <text fg={titleColor}>{title}</text>
+                    <text fg={metaColor}>{trimLine(meta, Math.max(20, width - 6))}</text>
+                    <text>{""}</text>
+                  </box>
+                );
+              })
+            )}
+          </box>
+        )}
+      </box>
+
+      <box height={footerHeight} justifyContent="center" alignItems="center" paddingX={1}>
+        <text fg="#8a8a8a">{trimLine(shortcuts, Math.max(20, width - 4))}</text>
+      </box>
+
+      {searchModal ? (
+        <box
+          position="absolute"
+          top={Math.max(1, Math.floor(height * 0.35))}
+          left={Math.max(2, Math.floor(width * 0.15))}
+          width={Math.max(28, Math.floor(width * 0.7))}
+          border
+          borderColor="#6b7280"
+          backgroundColor="#1c1c1c"
+          padding={1}
+          zIndex={30}
+        >
+          <text fg="#c6c6c6">{searchModal.mode === "local" ? "Local search" : "Global search"}</text>
+          <input
+            focused
+            value={searchModal.value}
+            placeholder="Type query and press Enter"
+            onInput={(value: string) => setSearchModal((prev) => (prev ? { ...prev, value } : prev))}
+            onSubmit={(value: string) => {
+              if (searchModal.mode === "local") {
+                runLocalSearch(value);
+              } else {
+                void runSearch(value);
+              }
+              setSearchModal(null);
+            }}
+          />
+          <text fg="#8a8a8a">Enter to submit, Esc to cancel</text>
+        </box>
+      ) : null}
     </box>
   );
 }

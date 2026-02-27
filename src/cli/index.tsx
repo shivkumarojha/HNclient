@@ -3,6 +3,7 @@ import { createCliRenderer } from "@opentui/core";
 import { createRoot } from "@opentui/react";
 import { App } from "../app/App.js";
 import { FEEDS } from "../core/constants.js";
+import { clearTerminal } from "../core/terminal.js";
 import type { FeedType } from "../core/types.js";
 import { loadConfig } from "../store/config-store.js";
 import { ensureAppDirs } from "../store/xdg.js";
@@ -38,6 +39,19 @@ const parseArgs = (argv: string[]): CliArgs => {
 };
 
 const main = async () => {
+  const cleanup = () => {
+    clearTerminal();
+  };
+  process.on("exit", cleanup);
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
+
   await ensureAppDirs();
   const config = await loadConfig();
   const args = parseArgs(process.argv.slice(2));
