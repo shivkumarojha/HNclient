@@ -24,6 +24,14 @@ interface TimeWindowOption {
   seconds: number;
 }
 
+interface SearchContext {
+  kind: "latest" | "global";
+  query: string;
+  windowIndex: number;
+  page: number;
+  nbPages: number;
+}
+
 interface AppProps {
   config: AppConfig;
   initialFeed: FeedType;
@@ -73,6 +81,7 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
   const [timeWindowModal, setTimeWindowModal] = useState(false);
   const [timeWindowIndex, setTimeWindowIndex] = useState(3);
   const [globalSearchWindowIndex, setGlobalSearchWindowIndex] = useState(3);
+  const [searchContext, setSearchContext] = useState<SearchContext | null>(null);
   const [status, setStatus] = useState("Loading Hacker News feed...");
   const [loading, setLoading] = useState(false);
   const [pendingG, setPendingG] = useState(false);
@@ -243,48 +252,161 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
     [config.cacheTtlSeconds.search, getCached]
   );
 
-  const runLatestWindow = useCallback(
-    async (windowSeconds: number) => {
-      const windowLabel = TIME_WINDOWS.find((option) => option.seconds === windowSeconds)?.label ?? "selected window";
-      setLoading(true);
-      setStatus(`Loading latest posts for ${windowLabel}...`);
-      try {
-        const page = await getCached(
-          `latest:0:${windowSeconds}`,
-          config.cacheTtlSeconds.search,
-          async () => search.search("", 0, windowSeconds)
-        );
-        const rows = page.hits
-          .map((hit): StoryRow | null => {
-            const id = Number.parseInt(hit.objectID, 10);
-            if (!Number.isFinite(id)) return null;
-            const row: StoryRow = {
-              id,
-              kind: "story",
-              title: stripHtml(hit.title ?? hit.story_title ?? "(no title)"),
-              by: hit.author ?? "unknown",
-              score: hit.points ?? 0,
-              comments: hit.num_comments ?? 0,
-              time: hit.created_at_i ?? 0
-            };
-            const resolved = hit.url ?? hit.story_url;
-            if (resolved) row.url = resolved;
-            return row;
-          })
-          .filter((row): row is StoryRow => Boolean(row));
+  const mapSearchRows = useCallback((hits: { objectID: string; title?: string; story_title?: string; author?: string; points?: number; num_comments?: number; created_at_i?: number; url?: string; story_url?: string }[]) => {
+    return hits
+      .map((hit): StoryRow | null => {
+        const id = Number.parseInt(hit.objectID, 10);
+        if (!Number.isFinite(id)) return null;
+        const row: StoryRow = {
+          id,
+          kind: "story",
+          title: stripHtml(hit.title ?? hit.story_title ?? "(no title)"),
+          by: hit.author ?? "unknown",
+          score: hit.points ?? 0,
+          comments: hit.num_comments ?? 0,
+          time: hit.created_at_i ?? 0
+        };
+        const resolved = hit.url ?? hit.story_url;
+        if (resolved) row.url = resolved;
+        return row;
+      })
+      .filter((row): row is StoryRow => Boolean(row));
+  }, []);
 
-        setSearchResults(rows);
+  const fetchWindowedPage = useCallback(
+    async (query: string, startWindowIndex: number, page: number) => {
+      let index = startWindowIndex;
+      while (index < TIME_WINDOWS.length) {
+        const seconds = TIME_WINDOWS[index]!.seconds;
+        const cacheKey = `${query ? `search:${query}` : "latest"}:${page}:${seconds}`;
+        const result = await getCached(cacheKey, config.cacheTtlSeconds.search, async () =>
+          search.search(query, page, seconds)
+        );
+        const rows = mapSearchRows(result.hits as never);
+        if (rows.length > 0 || index === TIME_WINDOWS.length - 1) {
+          return {
+            rows,
+            page: result.page,
+            nbPages: result.nbPages,
+            windowIndex: index
+          };
+        }
+        index += 1;
+      }
+      return {
+        rows: [],
+        page: 0,
+        nbPages: 0,
+        windowIndex: startWindowIndex
+      };
+    },
+    [config.cacheTtlSeconds.search, getCached, mapSearchRows]
+  );
+
+  const runGlobalSearch = useCallback(
+    async (query: string, startWindowIndex: number) => {
+      const cleaned = query.trim();
+      if (!cleaned) {
+        setStatus("Search query is empty.");
+        return;
+      }
+      setLoading(true);
+      setStatus(`Searching for \"${cleaned}\"...`);
+      try {
+        const page = await fetchWindowedPage(cleaned, startWindowIndex, 0);
+        setSearchQuery(cleaned);
+        setSearchResults(page.rows);
         setSearchCursor(0);
         setPane("search");
-        setStatus(`Latest posts loaded for ${windowLabel}: ${rows.length} results.`);
+        setGlobalSearchWindowIndex(page.windowIndex);
+        setSearchContext({
+          kind: "global",
+          query: cleaned,
+          windowIndex: page.windowIndex,
+          page: page.page,
+          nbPages: page.nbPages
+        });
+        const label = TIME_WINDOWS[page.windowIndex]?.label ?? "selected range";
+        setStatus(`Found ${page.rows.length} results for \"${cleaned}\" in ${label}.`);
+      } catch (error) {
+        setStatus(`Search failed: ${String(error)}`);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [fetchWindowedPage]
+  );
+
+  const runLatestWindow = useCallback(
+    async (windowIndex: number) => {
+      const chosenLabel = TIME_WINDOWS[windowIndex]?.label ?? "selected window";
+      setLoading(true);
+      setStatus(`Loading latest posts for ${chosenLabel}...`);
+      try {
+        const page = await fetchWindowedPage("", windowIndex, 0);
+        setSearchResults(page.rows);
+        setSearchCursor(0);
+        setPane("search");
+        setTimeWindowIndex(page.windowIndex);
+        setSearchContext({
+          kind: "latest",
+          query: "",
+          windowIndex: page.windowIndex,
+          page: page.page,
+          nbPages: page.nbPages
+        });
+        const label = TIME_WINDOWS[page.windowIndex]?.label ?? "selected window";
+        setStatus(`Latest posts loaded for ${label}: ${page.rows.length} results.`);
       } catch (error) {
         setStatus(`Latest load failed: ${String(error)}`);
       } finally {
         setLoading(false);
       }
     },
-    [config.cacheTtlSeconds.search, getCached]
+    [fetchWindowedPage]
   );
+
+  const loadMoreSearchResults = useCallback(async () => {
+    if (!searchContext || loading) return;
+    if (searchContext.page + 1 >= searchContext.nbPages) return;
+    const nextPage = searchContext.page + 1;
+    setLoading(true);
+    try {
+      const page = await fetchWindowedPage(searchContext.query, searchContext.windowIndex, nextPage);
+      setSearchResults((prev) => [...prev, ...page.rows]);
+      setSearchContext((prev) =>
+        prev
+          ? {
+              ...prev,
+              windowIndex: page.windowIndex,
+              page: page.page,
+              nbPages: page.nbPages
+            }
+          : prev
+      );
+      if (searchContext.kind === "global") {
+        setGlobalSearchWindowIndex(page.windowIndex);
+      } else {
+        setTimeWindowIndex(page.windowIndex);
+      }
+    } catch (error) {
+      setStatus(`Failed to load more results: ${String(error)}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [fetchWindowedPage, loading, searchContext]);
+
+  useEffect(() => {
+    if (pane === "search" && searchCursor >= searchResults.length - 2 && searchResults.length > 0) {
+      void loadMoreSearchResults();
+    }
+  }, [loadMoreSearchResults, pane, searchCursor, searchResults.length]);
+
+  useEffect(() => {
+    if (initialSearch) {
+      void runGlobalSearch(initialSearch, globalSearchWindowIndex);
+    }
+  }, [globalSearchWindowIndex, initialSearch, runGlobalSearch]);
 
   const runLocalSearch = useCallback(
     (query: string) => {
@@ -396,12 +518,6 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
   }, [initialFeed, refreshFeed]);
 
   useEffect(() => {
-    if (initialSearch) {
-      void runSearch(initialSearch);
-    }
-  }, [initialSearch, runSearch]);
-
-  useEffect(() => {
     if (pane === "feed" && cursor >= stories.length - 2 && stories.length < feedIds.length) {
       void loadMore();
     }
@@ -431,7 +547,7 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
         const chosen = TIME_WINDOWS[timeWindowIndex];
         setTimeWindowModal(false);
         if (!chosen) return;
-        void runLatestWindow(chosen.seconds);
+        void runLatestWindow(timeWindowIndex);
       }
       if (/[1-7]/.test(key.name)) {
         const idx = Number.parseInt(key.name, 10) - 1;
@@ -439,7 +555,7 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
         setTimeWindowModal(false);
         if (!chosen) return;
         setTimeWindowIndex(idx);
-        void runLatestWindow(chosen.seconds);
+        void runLatestWindow(idx);
       }
       return;
     }
@@ -662,7 +778,7 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
         >
           <text fg="#c6c6c6">{searchModal.mode === "local" ? "Local search" : "Global search"}</text>
           {searchModal.mode === "global" ? (
-            <text fg="#8a8a8a">{`Time window: ${TIME_WINDOWS[searchModal.windowIndex ?? globalSearchWindowIndex]?.label ?? "Last 7 days"} (Tab to change)`}</text>
+            <text fg="#60a5fa">{`Time window: ${TIME_WINDOWS[searchModal.windowIndex ?? globalSearchWindowIndex]?.label ?? "Last 7 days"} (Tab to change)`}</text>
           ) : null}
           <input
             focused
@@ -677,9 +793,9 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
                 const chosen = TIME_WINDOWS[idx];
                 if (chosen) {
                   setGlobalSearchWindowIndex(idx);
-                  void runSearch(value, chosen.seconds);
+                  void runGlobalSearch(value, idx);
                 } else {
-                  void runSearch(value);
+                  void runGlobalSearch(value, globalSearchWindowIndex);
                 }
               }
               setSearchModal(null);
