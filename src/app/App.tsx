@@ -3,7 +3,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { openExternal } from "../core/browser.js";
 import { buildCommentTree, flattenCommentTree } from "../core/comments.js";
 import { FEEDS } from "../core/constants.js";
-import { clearTerminal } from "../core/terminal.js";
 import type { AppConfig, CommentNode, FeedType, HNItem, StoryRow } from "../core/types.js";
 import { stripHtml, trimLine, unixToRelative } from "../core/utils.js";
 import { AlgoliaSearchService } from "../data/algolia.js";
@@ -37,6 +36,7 @@ interface AppProps {
   initialFeed: FeedType;
   initialSearch?: string;
   noCache: boolean;
+  onRequestExit: () => void;
 }
 
 const hn = new FirebaseHNService();
@@ -61,7 +61,7 @@ const domainFromUrl = (url?: string): string => {
   }
 };
 
-export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
+export function App({ config, initialFeed, initialSearch, noCache, onRequestExit }: AppProps) {
   const { width, height } = useTerminalDimensions();
 
   const [pane, setPane] = useState<Pane>("feed");
@@ -509,9 +509,8 @@ export function App({ config, initialFeed, initialSearch, noCache }: AppProps) {
   );
 
   const exitApp = useCallback(() => {
-    clearTerminal();
-    process.exit(0);
-  }, []);
+    onRequestExit();
+  }, [onRequestExit]);
 
   useEffect(() => {
     void refreshFeed(initialFeed, true);

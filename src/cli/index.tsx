@@ -39,18 +39,42 @@ const parseArgs = (argv: string[]): CliArgs => {
 };
 
 const main = async () => {
-  const cleanup = () => {
+  let shuttingDown = false;
+  let root: { unmount: () => void } | null = null;
+  let rendererRef: { destroy: () => void } | null = null;
+
+  const shutdown = (code = 0) => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+
+    try {
+      root?.unmount();
+    } catch {
+      // no-op during shutdown
+    }
+
+    try {
+      rendererRef?.destroy();
+    } catch {
+      // no-op during shutdown
+    }
+
+    try {
+      if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
+        process.stdin.setRawMode(false);
+      }
+    } catch {
+      // no-op during shutdown
+    }
+
     clearTerminal();
+    process.exit(code);
   };
-  process.on("exit", cleanup);
-  process.on("SIGINT", () => {
-    cleanup();
-    process.exit(0);
-  });
-  process.on("SIGTERM", () => {
-    cleanup();
-    process.exit(0);
-  });
+
+  process.on("SIGINT", () => shutdown(0));
+  process.on("SIGTERM", () => shutdown(0));
 
   await ensureAppDirs();
   const config = await loadConfig();
@@ -58,8 +82,9 @@ const main = async () => {
   const initialFeed = args.feed ?? config.defaultFeed;
 
   const renderer = await createCliRenderer({
-    exitOnCtrlC: true
+    exitOnCtrlC: false
   });
+  rendererRef = renderer as { destroy: () => void };
 
   const appProps = {
     config,
@@ -67,8 +92,13 @@ const main = async () => {
     noCache: Boolean(args.noCache)
   } as const;
 
-  createRoot(renderer).render(
-    args.search ? <App {...appProps} initialSearch={args.search} /> : <App {...appProps} />
+  const renderRoot = createRoot(renderer);
+  root = renderRoot;
+
+  renderRoot.render(
+    args.search
+      ? <App {...appProps} initialSearch={args.search} onRequestExit={() => shutdown(0)} />
+      : <App {...appProps} onRequestExit={() => shutdown(0)} />
   );
 };
 
