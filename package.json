@@ -7,11 +7,14 @@
     "hn": "./bin/hn.cjs"
   },
   "files": [
-    "dist"
+    "dist",
+    "bin",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "dev": "tsx src/cli/index.tsx",
-    "build": "tsc -p tsconfig.json",
+    "build": "rm -rf dist && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "lint": "eslint src --ext .ts,.tsx",
@@ -23,11 +26,15 @@
     "tui",
     "opentui"
   ],
-  "author": "",
+  "author": "shiv",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@opentui/core": "^0.1.84",
     "@opentui/react": "^0.1.84",
+    "hnclient": "^0.1.0",
     "html-to-text": "^9.0.5",
     "react": "^19.2.4"
   },
